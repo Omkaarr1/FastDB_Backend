@@ -1,0 +1,4 @@
+nfa_files/*
+lmdb_data/*
+Dockerfile
+__pycache__/*
