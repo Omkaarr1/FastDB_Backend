@@ -17,7 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from typing import List, Optional
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+import os
 # Password Hashing & JWT
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -1108,3 +1112,203 @@ async def clear_files(current_user: dict = Depends(get_current_user)):
 @app.on_event("startup")
 async def on_startup():
     init_lmdb()
+
+
+
+
+
+
+# --------------------------------------------------
+# ADMIN SECTION
+# --------------------------------------------------
+
+# Create a dependency that verifies the current user is an admin.
+def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict:
+    if 2 not in current_user["role"]:
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+    return current_user
+
+# Define additional Pydantic models for admin operations.
+class AdminEditUser(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    name: Optional[str] = None
+    role: Optional[List[int]] = None
+
+class AdminCreateUser(BaseModel):
+    username: str
+    password: str
+    name: str
+    role: List[int]
+
+# Create an APIRouter for admin endpoints.
+admin_router = APIRouter(prefix="/admin", tags=["admin"])
+
+# 1) View Total Number of Requests
+@admin_router.get("/total-requests")
+async def total_requests(admin: dict = Depends(get_admin_user)):
+    total = len(list_all_requests())
+    return {"total_requests": total}
+
+# 2) Total Pending Requests (status NEW or IN_PROGRESS)
+@admin_router.get("/pending-requests")
+async def pending_requests(admin: dict = Depends(get_admin_user)):
+    all_requests = list_all_requests()
+    pending = [r for r in all_requests if r["status"] in ("NEW", "IN_PROGRESS")]
+    return {"total_pending_requests": len(pending)}
+
+# 3) View All Users
+@admin_router.get("/users", response_model=List[UserResponse])
+async def admin_view_all_users(admin: dict = Depends(get_admin_user)):
+    return list_all_users()
+
+# 4) Edit any User (username, password, name, role)
+@admin_router.put("/users/{user_id}", response_model=UserResponse)
+async def admin_edit_user(user_id: int, user_edit: AdminEditUser, admin: dict = Depends(get_admin_user)):
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user_edit.username:
+        user["username"] = user_edit.username
+    if user_edit.password:
+        user["hashed_password"] = get_password_hash(user_edit.password)
+    if user_edit.name:
+        user["name"] = user_edit.name
+    if user_edit.role:
+        user["role"] = user_edit.role
+    update_user(user)
+    return user
+
+# 5) Add More Users
+@admin_router.post("/users", response_model=UserResponse)
+async def admin_create_user(user_data: AdminCreateUser, admin: dict = Depends(get_admin_user)):
+    if get_user_by_username(user_data.username):
+        raise HTTPException(status_code=400, detail="User with this username already exists.")
+    new_user = {
+        "username": user_data.username,
+        "name": user_data.name,
+        "role": user_data.role,
+        "hashed_password": get_password_hash(user_data.password)
+    }
+    created_user = insert_user(new_user)
+    return created_user
+
+# 6) Delete User
+@admin_router.delete("/users/{user_id}")
+async def admin_delete_user(user_id: int, admin: dict = Depends(get_admin_user)):
+    with LMDB_ENV.begin(write=True, db=DB_USERS) as txn:
+        key = str(user_id).encode()
+        if not txn.get(key, db=DB_USERS):
+            raise HTTPException(status_code=404, detail="User not found")
+        txn.delete(key, db=DB_USERS)
+    return {"detail": f"User {user_id} deleted successfully."}
+
+# 7) Find Out Number of Pending Requests per User
+@admin_router.get("/users/pending-requests")
+async def pending_requests_per_user(admin: dict = Depends(get_admin_user)):
+    users = list_all_users()
+    all_requests = list_all_requests()
+    results = []
+    for user in users:
+        # Count requests initiated by the user that are pending.
+        pending = [r for r in all_requests if r["initiator_id"] == user["id"] and r["status"] in ("NEW", "IN_PROGRESS")]
+        results.append({"user_id": user["id"], "pending_requests": len(pending)})
+    return results
+
+# 8) Approve Requests on Behalf of the User (set status to "Approved by ADMIN")
+@admin_router.post("/requests/{request_id}/approve")
+async def admin_approve_request(request_id: int, admin: dict = Depends(get_admin_user)):
+    req = get_request_by_id(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
+    req["status"] = "Approved by ADMIN"
+    req["last_action"] = f"Approved by ADMIN at {current_time_str}"
+    req["updated_at"] = current_time_str
+    update_request(req)
+    return {"detail": f"Request {request_id} approved by ADMIN."}
+
+# 9) View Uploaded Files by the User
+@admin_router.get("/users/{user_id}/files")
+async def admin_view_user_files(user_id: int, admin: dict = Depends(get_admin_user)):
+    # Aggregate files from all requests initiated by the user.
+    user_requests = [r for r in list_all_requests() if r["initiator_id"] == user_id]
+    files = []
+    for req in user_requests:
+        if "files" in req and isinstance(req["files"], list):
+            files.extend(req["files"])
+    return {"user_id": user_id, "files": files}
+
+# 10) Delete Uploaded Files by the User
+@admin_router.delete("/requests/{request_id}/files")
+async def admin_delete_request_file(request_id: int, file_url: str, admin: dict = Depends(get_admin_user)):
+    req = get_request_by_id(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if "files" not in req or not isinstance(req["files"], list):
+        raise HTTPException(status_code=404, detail="No files found for this request")
+    original_files = req["files"]
+    updated_files = [f for f in original_files if f.get("file_url") != file_url]
+    if len(updated_files) == len(original_files):
+        raise HTTPException(status_code=404, detail="File not found in the request")
+    req["files"] = updated_files
+    update_request(req)
+    # Remove the file from the filesystem if it exists.
+    file_path = file_url.lstrip("/")  # Remove the leading slash to form a relative path.
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    return {"detail": f"File {file_url} deleted from request {request_id}."}
+
+# 11) Add More Files for the User (to a given request)
+@admin_router.post("/requests/{request_id}/files")
+async def admin_add_files_to_request(
+    request_id: int,
+    files: Optional[List[UploadFile]] = File(None),
+    admin: dict = Depends(get_admin_user)
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    req = get_request_by_id(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    file_records = req.get("files", [])
+    for file in files:
+        original_filename = file.filename or "unnamed_file"
+        sanitized_filename = original_filename.replace(" ", "_")
+        timestamp = datetime.now(IST).strftime('%Y%m%d%H%M%S')
+        new_filename = f"{request_id}_{timestamp}_{sanitized_filename}"
+        file_location = os.path.join(UPLOAD_FOLDER, new_filename)
+        # For simplicity we use synchronous file I/O here; consider using aiofiles.
+        file.file.seek(0)
+        content = await file.read()
+        with open(file_location, "wb") as f:
+            f.write(content)
+        file_record = {"file_url": f"/files/{new_filename}", "file_display_name": original_filename}
+        file_records.append(file_record)
+    req["files"] = file_records
+    update_request(req)
+    return {"detail": f"Files added to request {request_id}.", "files": file_records}
+
+# 12) Add Comments for the User (if they forgot to add in their section)
+@admin_router.post("/requests/{request_id}/comments")
+async def admin_add_comment(
+    request_id: int,
+    comment: str = Form(...),
+    admin: dict = Depends(get_admin_user)
+):
+    req = get_request_by_id(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    # Save admin comments in a new field (or append to existing comments)
+    if "admin_comment" in req and req["admin_comment"]:
+        req["admin_comment"] += f" | {comment}"
+    else:
+        req["admin_comment"] = comment
+    current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
+    req["last_action"] = f"Admin comment added at {current_time_str}"
+    req["updated_at"] = current_time_str
+    update_request(req)
+    return {"detail": f"Comment added to request {request_id}.", "admin_comment": req["admin_comment"]}
+
+# Finally, include the admin router in your main FastAPI app.
+app.include_router(admin_router)
