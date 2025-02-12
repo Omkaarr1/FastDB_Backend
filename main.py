@@ -653,39 +653,82 @@ async def list_requests(
         responses.append(await to_request_response(r))
     return responses
 
+def displayOrNA(value):
+    if value is None or str(value).strip() == "":
+        return "N/A"
+    return str(value)
+
 # Download PDF for approved requests – now available to all logged‑in users if approved
 @app.get("/requests/{request_id}/pdf")
 async def download_pdf(request_id: int, current_user: dict = Depends(get_current_user)):
-    req = get_request_by_id(request_id)
+    req = get_request_by_id(request_id)  # Assume this returns the request as a dict
     if not req:
         raise HTTPException(status_code=404, detail="NFA not found")
     if req["status"] != "APPROVED":
         raise HTTPException(status_code=400, detail="PDF can only be downloaded for approved NFAs.")
-    
-    # Create PDF buffer and canvas
+
+    # Create PDF buffer and canvas.
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    margin = 40  # reduced margin
+    margin = 40  # Reduced margin
 
-    # Draw centered heading with a slightly smaller font
+    # ----------------------------
+    # Draw Bold Heading: NFA Request Details
+    # ----------------------------
     c.setFont("Helvetica-Bold", 18)
-    title_text = "NFA Approval Summary"
-    title_width = c.stringWidth(title_text, "Helvetica-Bold", 18)
-    c.drawString((width - title_width) / 2, height - margin, title_text)
+    details_title = "NFA Request Details"
+    title_width = c.stringWidth(details_title, "Helvetica-Bold", 18)
+    c.drawString((width - title_width) / 2, height - margin, details_title)
 
-    # Define table parameters with reduced spacing
-    table_top = height - margin - 30
-    row_height = 20  # reduced row height
-    # Column widths: [S.No, Particular, Name & Designation, Request-Received-Date, Request-Approved-Date]
+    # Starting Y coordinate for the details section.
+    y_position = height - margin - 30
+
+    # List of (Label, Value) for the submitted NFA fields.
+    details = [
+        ("Initiator ID", req.get("initiator_id")),
+        ("Supervisor ID", req.get("supervisor_id")),
+        ("Subject", req.get("subject")),
+        ("Description", req.get("description")),
+        ("Area", req.get("area")),
+        ("Project", req.get("project")),
+        ("Tower", req.get("tower")),
+        ("Department", req.get("department")),
+        ("Priority", req.get("priority")),
+        ("References", req.get("references"))
+    ]
+    for label, value in details:
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y_position, f"{label}:")
+        c.setFont("Helvetica", 12)
+        c.drawString(margin + 150, y_position, displayOrNA(value))
+        y_position -= 20
+
+    # Leave a gap before the table.
+    y_position -= 30
+
+    # ----------------------------
+    # Draw Table Heading: NFA Approval Summary
+    # ----------------------------
+    c.setFont("Helvetica-Bold", 18)
+    table_title = "NFA Approval Summary"
+    table_title_width = c.stringWidth(table_title, "Helvetica-Bold", 18)
+    c.drawString((width - table_title_width) / 2, y_position, table_title)
+    y_position -= 30
+
+    # ----------------------------
+    # Draw the Approval Table
+    # ----------------------------
+    row_height = 20  # Reduced row height
+    # Column widths: [S.No, Particular, Name & Designation, Received Date, Approved Date]
     col_widths = [30, 150, 120, 100, 100]
     x_positions = [margin]
     for w in col_widths[:-1]:
         x_positions.append(x_positions[-1] + w)
 
-    # Draw table header background and borders
+    # Draw table header background and borders.
     c.setFillColorRGB(0.85, 0.85, 0.85)
-    c.rect(margin, table_top - row_height, sum(col_widths), row_height, fill=1, stroke=0)
+    c.rect(margin, y_position - row_height, sum(col_widths), row_height, fill=1, stroke=0)
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
     headers = [
@@ -696,16 +739,16 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         "Approved Date"
     ]
     for i, header in enumerate(headers):
-        c.drawString(x_positions[i] + 2, table_top - row_height + 5, header)
-    # Draw header cell borders
-    let = margin
+        c.drawString(x_positions[i] + 2, y_position - row_height + 5, header)
+    # Draw header borders.
+    temp_x = margin
     for w in col_widths:
-        c.rect(let, table_top - row_height, w, row_height, stroke=1, fill=0)
-        let += w
+        c.rect(temp_x, y_position - row_height, w, row_height, stroke=1, fill=0)
+        temp_x += w
 
-    # Build rows data
+    # Build table rows.
     rows = []
-    # Row 1: Initiator details
+    # Row 1: Initiator details.
     initiator = get_user_by_id(req["initiator_id"])
     initiator_name = initiator["name"] if initiator else "Unknown"
     rows.append({
@@ -715,7 +758,7 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         "received": req["created_at"],
         "approved": "-"
     })
-    # Row 2: Supervisor details
+    # Row 2: Supervisor details.
     supervisor = get_user_by_id(req["supervisor_id"])
     supervisor_name = supervisor["name"] if supervisor else "Unknown"
     sup_approved = req.get("supervisor_approved_at") if req.get("supervisor_approved_at") else "Pending"
@@ -726,7 +769,7 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         "received": req["created_at"],
         "approved": sup_approved
     })
-    # Rows for each approver in the chain
+    # Rows for each approver in the chain.
     sno = 3
     for approver_id in req["approvers"]:
         user_obj = get_user_by_id(approver_id)
@@ -743,9 +786,9 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         })
         sno += 1
 
-    # Draw each table row with borders and text
+    # Draw table rows.
     c.setFont("Helvetica", 10)
-    current_y = table_top - row_height
+    current_y = y_position - row_height
     for row in rows:
         current_y -= row_height
         current_x = margin
@@ -758,13 +801,15 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         c.drawString(x_positions[3] + 2, current_y + 5, row["received"])
         c.drawString(x_positions[4] + 2, current_y + 5, row["approved"])
 
-    # Draw a blue note at the bottom
-    c.setFillColorRGB(0, 0, 1)  # blue color
+    # ----------------------------
+    # Draw a blue note at the bottom.
+    # ----------------------------
+    c.setFillColorRGB(0, 0, 1)  # Blue color.
     c.setFont("Helvetica-Bold", 12)
     note = "This is a system generated pdf, no need of signatures"
     note_width = c.stringWidth(note, "Helvetica-Bold", 12)
     c.drawString((width - note_width) / 2, 20, note)
-    c.setFillColorRGB(0, 0, 0)  # revert to black
+    c.setFillColorRGB(0, 0, 0)  # Revert to black.
 
     c.showPage()
     c.save()
