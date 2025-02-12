@@ -4,12 +4,9 @@ import json
 import traceback
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
+import uuid
 
-# Install uvloop for improved event loop performance (if running on POSIX)
-# import uvloop
-# uvloop.install()
-
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import ORJSONResponse, StreamingResponse, JSONResponse, FileResponse
@@ -17,22 +14,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
-from typing import List, Optional
-from pydantic import BaseModel
-from datetime import datetime, timedelta
-import os
-# Password Hashing & JWT
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-
-# LMDB for key-value persistence
 import lmdb
 
 # --------------------------------------------------
 # 1. Environment Variables & IST Timestamp
 # --------------------------------------------------
-DATABASE_PATH = os.getenv("DATABASE_PATH", "./lmdb_data")  # LMDB will use a directory here.
+DATABASE_PATH = os.getenv("DATABASE_PATH", "./lmdb_data")
 SECRET_KEY = os.getenv("SECRET_KEY", "my-secret-key")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -46,18 +35,19 @@ DB_USERS = None
 DB_REQUESTS = None
 DB_APPROVER_ACTIONS = None
 DB_ERROR_LOGS = None
+DB_TOKENS = None  # Sub-database for active tokens
 
 def init_lmdb():
-    """Initialize LMDB environment and open sub–databases."""
-    global LMDB_ENV, DB_USERS, DB_REQUESTS, DB_APPROVER_ACTIONS, DB_ERROR_LOGS
+    """Initialize LMDB environment and open sub-databases."""
+    global LMDB_ENV, DB_USERS, DB_REQUESTS, DB_APPROVER_ACTIONS, DB_ERROR_LOGS, DB_TOKENS
     if not os.path.exists(DATABASE_PATH):
         os.makedirs(DATABASE_PATH)
-    # Open an LMDB environment with a 1GB map size and up to 10 named DBs.
     LMDB_ENV = lmdb.open(DATABASE_PATH, map_size=1024 * 1024 * 1024, max_dbs=10)
     DB_USERS = LMDB_ENV.open_db(b'users')
     DB_REQUESTS = LMDB_ENV.open_db(b'requests')
     DB_APPROVER_ACTIONS = LMDB_ENV.open_db(b'approver_actions')
     DB_ERROR_LOGS = LMDB_ENV.open_db(b'error_logs')
+    DB_TOKENS = LMDB_ENV.open_db(b'active_tokens')
 
 def get_next_id(txn, db_handle):
     """Generate an auto–incremented ID for a given LMDB sub–database."""
@@ -187,8 +177,8 @@ def delete_approver_actions_by_request(request_id: int) -> None:
                 action = json.loads(value.decode())
                 if action.get("request_id") == request_id:
                     keys_to_delete.append(key)
-            for key in keys_to_delete:
-                txn.delete(key, db=DB_APPROVER_ACTIONS)
+            for k in keys_to_delete:
+                txn.delete(k, db=DB_APPROVER_ACTIONS)
 
 # Error Logs
 def insert_error_log(log: dict) -> None:
@@ -213,13 +203,95 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
+    # Embed a unique session identifier (jti)
+    to_encode.update({
+        "exp": expire,
+        "jti": str(uuid.uuid4())
+    })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # --------------------------------------------------
-# 5. Global In–Memory Token Blacklist
+# 5. Persistent Token Store Helper Functions (Updated for multi-login IP/user-agent)
 # --------------------------------------------------
-token_blacklist = set()
+def store_token(token: str, details: dict):
+    """
+    Stores token details using the token's 'jti' (session ID) as the key.
+    'details' can include user_id, ip_address, user_agent, login time, etc.
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        session_id = payload.get("jti")
+        if not session_id:
+            raise ValueError("Token missing session identifier (jti)")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    with LMDB_ENV.begin(write=True, db=DB_TOKENS) as txn:
+        txn.put(session_id.encode(), json.dumps(details).encode(), db=DB_TOKENS)
+
+def remove_token(token: str):
+    """
+    Removes a token from the DB_TOKENS sub-database using its session ID (jti).
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        session_id = payload.get("jti")
+    except JWTError:
+        return  # Nothing to remove if token is invalid.
+    if session_id:
+        with LMDB_ENV.begin(write=True, db=DB_TOKENS) as txn:
+            txn.delete(session_id.encode(), db=DB_TOKENS)
+
+def get_token_details(token: str) -> Optional[dict]:
+    """
+    Retrieves token details from the DB_TOKENS sub-database by its session ID (jti).
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        session_id = payload.get("jti")
+    except JWTError:
+        return None
+    if not session_id:
+        return None
+    with LMDB_ENV.begin(db=DB_TOKENS) as txn:
+        data = txn.get(session_id.encode(), db=DB_TOKENS)
+        if data:
+            return json.loads(data.decode())
+    return None
+
+def list_tokens_by_user(user_id: int) -> List[dict]:
+    """
+    Lists all active sessions for a user by iterating over the DB_TOKENS sub-database.
+    Returns a list of session dictionaries that can include login_time, ip_address, user_agent, etc.
+    """
+    sessions = []
+    with LMDB_ENV.begin(db=DB_TOKENS) as txn:
+        with txn.cursor(db=DB_TOKENS) as cursor:
+            for key, value in cursor:
+                details = json.loads(value.decode())
+                if details.get("user_id") == user_id:
+                    # Convert created_at from string to datetime if needed
+                    sessions.append({
+                        "session_id": key.decode(),
+                        "login_time": details.get("created_at"),
+                        "ip_address": details.get("ip_address"),
+                        "user_agent": details.get("user_agent")
+                    })
+    return sessions
+
+def remove_tokens_by_user(user_id: int):
+    """
+    Removes all active sessions for a given user.
+    """
+    with LMDB_ENV.begin(write=True, db=DB_TOKENS) as txn:
+        with txn.cursor(db=DB_TOKENS) as cursor:
+            keys_to_delete = []
+            for key, value in cursor:
+                details = json.loads(value.decode())
+                if details.get("user_id") == user_id:
+                    keys_to_delete.append(key)
+            for k in keys_to_delete:
+                txn.delete(k, db=DB_TOKENS)
 
 # --------------------------------------------------
 # 6. Pydantic Schemas
@@ -254,7 +326,6 @@ class ApproverActionResponse(BaseModel):
     class Config:
         orm_mode = True
 
-# Updated RequestResponse schema to include multiple files
 class RequestResponse(BaseModel):
     id: int
     initiator_id: int
@@ -287,6 +358,12 @@ class ApprovalAction(BaseModel):
     request_id: int
     approved: bool
     comment: Optional[str] = None
+
+class SessionInfo(BaseModel):
+    session_id: str
+    login_time: Optional[str] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
 
 # --------------------------------------------------
 # 7. FastAPI App, CORS & Static Files
@@ -326,8 +403,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 # 9. Dependencies & get_current_user
 # --------------------------------------------------
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
-    if token in token_blacklist:
-        raise HTTPException(status_code=401, detail="Token has been revoked.")
+    # Check if the token exists in the persistent token store.
+    details = get_token_details(token)
+    if not details:
+        raise HTTPException(status_code=401, detail="Token is not active. Please login.")
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid token",
@@ -368,15 +447,18 @@ async def to_request_response(r: dict) -> RequestResponse:
     supervisor_name = supervisor["name"] if supervisor else "Unknown"
     pending_at = None
     approval_hierarchy = []
+
+    # Supervisor row
     approval_hierarchy.append({
-         "role": "Supervisor",
-         "user_id": r["supervisor_id"],
-         "name": supervisor_name,
-         "approved": "Approved" if r.get("supervisor_approved") is True else ("Declined" if r.get("supervisor_approved") is False else "Pending"),
-         "received_at": r["created_at"],
-         "action_time": r.get("supervisor_approved_at"),
-         "comment": r.get("supervisor_comment")
+        "role": "Supervisor",
+        "user_id": r["supervisor_id"],
+        "name": supervisor_name,
+        "approved": "Approved" if r.get("supervisor_approved") is True else ("Declined" if r.get("supervisor_approved") is False else "Pending"),
+        "received_at": r["created_at"],
+        "action_time": r.get("supervisor_approved_at"),
+        "comment": r.get("supervisor_comment")
     })
+
     if r["status"] == "IN_PROGRESS":
         for approver_id in r["approvers"]:
             action_obj = get_approver_action(r["id"], approver_id)
@@ -431,6 +513,7 @@ async def to_request_response(r: dict) -> RequestResponse:
                 "action_time": action_obj.get("action_time") if action_obj and action_obj.get("action_time") else "Pending",
                 "comment": action_obj.get("comment") if action_obj else None
             })
+
     if r["status"] == "IN_PROGRESS":
         if r["current_approver_index"] < len(r["approvers"]):
             next_approver = get_user_by_id(r["approvers"][r["current_approver_index"]])
@@ -481,6 +564,11 @@ async def to_request_response(r: dict) -> RequestResponse:
     }
     return RequestResponse(**response)
 
+def displayOrNA(value):
+    if value is None or str(value).strip() == "":
+        return "N/A"
+    return str(value)
+
 # --------------------------------------------------
 # 11. Auth & User Endpoints
 # --------------------------------------------------
@@ -498,17 +586,46 @@ async def register_user(user_data: UserCreate):
     return new_user
 
 @app.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     user = get_user_by_username(form_data.username)
     if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     access_token = create_access_token(data={"sub": str(user["id"])})
+    # Gather IP and User-Agent
+    client_ip = request.client.host if request.client else "Unknown"
+    user_agent = request.headers.get("User-Agent", "Unknown")
+    # Store the token (using its session id) along with login details (including IP and user-agent).
+    store_token(access_token, {
+        "user_id": user["id"],
+        "created_at": datetime.utcnow().isoformat(),
+        "ip_address": client_ip,
+        "user_agent": user_agent
+    })
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/logout")
 async def logout(token: str = Depends(oauth2_scheme)):
-    token_blacklist.add(token)
+    remove_token(token)
     return {"detail": "Successfully logged out."}
+
+@app.post("/logout_all")
+async def logout_all(current_user: dict = Depends(get_current_user)):
+    remove_tokens_by_user(current_user["id"])
+    return {"detail": "Logged out from all sessions."}
+
+@app.get("/sessions", response_model=List[SessionInfo])
+async def list_sessions(current_user: dict = Depends(get_current_user)):
+    sessions = list_tokens_by_user(current_user["id"])
+    # Convert each record into SessionInfo
+    result = []
+    for s in sessions:
+        result.append(SessionInfo(
+            session_id=s.get("session_id"),
+            login_time=s.get("login_time"),
+            ip_address=s.get("ip_address"),
+            user_agent=s.get("user_agent")
+        ))
+    return result
 
 @app.get("/users/me", response_model=UserResponse)
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
@@ -528,7 +645,6 @@ async def list_users(current_user: dict = Depends(get_current_user)):
 # --------------------------------------------------
 # 12. Request Endpoints
 # --------------------------------------------------
-# Create Request with support for multiple file uploads
 @app.post("/requests/", response_model=RequestResponse, status_code=status.HTTP_201_CREATED)
 async def create_request(
     initiator_id: int = Form(...),
@@ -545,7 +661,6 @@ async def create_request(
     files: Optional[List[UploadFile]] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    print(f"[DEBUG] Received create_request with initiator_id: {initiator_id} and supervisor_id: {supervisor_id}")
     if current_user["id"] != initiator_id:
         raise HTTPException(status_code=403, detail="You can only create NFAs for yourself.")
     if supervisor_id == current_user["id"]:
@@ -553,14 +668,16 @@ async def create_request(
     supervisor = get_user_by_id(supervisor_id)
     if not supervisor:
         raise HTTPException(status_code=404, detail="Supervisor not found.")
+
     try:
         approvers_list = json.loads(approvers)
+        # Ensure supervisor_id is not in the approver list
         approvers_list = [x for x in approvers_list if x != supervisor_id]
         if not isinstance(approvers_list, list) or not all(isinstance(x, int) for x in approvers_list):
             raise ValueError
     except ValueError:
         raise HTTPException(status_code=400, detail="Approvers must be a JSON list of user IDs.")
-    
+
     current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
     new_req = {
         "initiator_id": initiator_id,
@@ -585,37 +702,29 @@ async def create_request(
         "files": []
     }
     new_req = insert_request(new_req)
-    print(f"[DEBUG] New request created with id: {new_req['id']}")
-    
+
     file_records = []
     if files is not None:
-        print(f"[DEBUG] Starting file upload for create_request, files: {files}")
         for file in files:
             original_filename = file.filename or "unnamed_file"
             sanitized_filename = original_filename.replace(" ", "_")
-            ext = sanitized_filename.split('.')[-1].lower() if '.' in sanitized_filename else ''
             timestamp = datetime.now(IST).strftime('%Y%m%d%H%M%S')
             new_filename = f"{new_req['id']}_{timestamp}_{sanitized_filename}"
             file_location = os.path.join(UPLOAD_FOLDER, new_filename)
-            print(f"[DEBUG] Saving file {original_filename} as {new_filename}")
             try:
                 file.file.seek(0)
                 content = await file.read()
                 with open(file_location, "wb") as f:
                     f.write(content)
-                print(f"[DEBUG] File saved at {file_location}")
                 file_record = {"file_url": f"/files/{new_filename}", "file_display_name": original_filename}
                 file_records.append(file_record)
             except Exception as e:
-                print(f"[DEBUG] Error saving file {original_filename}: {e}")
                 raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
     new_req["files"] = file_records
     update_request(new_req)
-    print(f"[DEBUG] Updated request with file records: {new_req['files']}")
-    
     return await to_request_response(new_req)
 
-# List Requests with optional filters
 @app.get("/requests/", response_model=List[RequestResponse])
 async def list_requests(
     note_id: Optional[int] = None,
@@ -627,6 +736,7 @@ async def list_requests(
     all_requests = list_all_requests()
     if note_id:
         all_requests = [r for r in all_requests if r["id"] == note_id]
+
     if date:
         try:
             date_obj = datetime.strptime(date, "%Y-%m-%d")
@@ -637,17 +747,20 @@ async def list_requests(
             all_requests = [r for r in all_requests if within_date(r)]
         except ValueError:
             raise HTTPException(status_code=400, detail="Date must be in YYYY-MM-DD format")
+
     if initiator:
         def match_initiator(r):
-            user = get_user_by_id(r["initiator_id"])
-            return user and initiator.lower() in user["name"].lower()
+            user_ = get_user_by_id(r["initiator_id"])
+            return user_ and initiator.lower() in user_["name"].lower()
         all_requests = [r for r in all_requests if match_initiator(r)]
+
     if filter:
         f = filter.upper()
         if f == "PENDING":
             all_requests = [r for r in all_requests if r["status"] in ("NEW", "IN_PROGRESS")]
         elif f == "APPROVED":
             all_requests = [r for r in all_requests if r["status"] == "APPROVED"]
+
     visible = []
     for r in all_requests:
         if await can_view_request(r, current_user):
@@ -657,38 +770,25 @@ async def list_requests(
         responses.append(await to_request_response(r))
     return responses
 
-def displayOrNA(value):
-    if value is None or str(value).strip() == "":
-        return "N/A"
-    return str(value)
-
-# Download PDF for approved requests – now available to all logged‑in users if approved
 @app.get("/requests/{request_id}/pdf")
 async def download_pdf(request_id: int, current_user: dict = Depends(get_current_user)):
-    req = get_request_by_id(request_id)  # Assume this returns the request as a dict
+    req = get_request_by_id(request_id)
     if not req:
         raise HTTPException(status_code=404, detail="NFA not found")
     if req["status"] != "APPROVED":
         raise HTTPException(status_code=400, detail="PDF can only be downloaded for approved NFAs.")
 
-    # Create PDF buffer and canvas.
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    margin = 40  # Reduced margin
+    margin = 40
 
-    # ----------------------------
-    # Draw Bold Heading: NFA Request Details
-    # ----------------------------
     c.setFont("Helvetica-Bold", 18)
     details_title = "NFA Request Details"
     title_width = c.stringWidth(details_title, "Helvetica-Bold", 18)
     c.drawString((width - title_width) / 2, height - margin, details_title)
-
-    # Starting Y coordinate for the details section.
     y_position = height - margin - 30
 
-    # List of (Label, Value) for the submitted NFA fields.
     details = [
         ("Initiator ID", req.get("initiator_id")),
         ("Supervisor ID", req.get("supervisor_id")),
@@ -708,51 +808,32 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         c.drawString(margin + 150, y_position, displayOrNA(value))
         y_position -= 20
 
-    # Leave a gap before the table.
     y_position -= 30
-
-    # ----------------------------
-    # Draw Table Heading: NFA Approval Summary
-    # ----------------------------
     c.setFont("Helvetica-Bold", 18)
     table_title = "NFA Approval Summary"
     table_title_width = c.stringWidth(table_title, "Helvetica-Bold", 18)
     c.drawString((width - table_title_width) / 2, y_position, table_title)
     y_position -= 30
 
-    # ----------------------------
-    # Draw the Approval Table
-    # ----------------------------
-    row_height = 20  # Reduced row height
-    # Column widths: [S.No, Particular, Name & Designation, Received Date, Approved Date]
+    row_height = 20
     col_widths = [30, 150, 120, 100, 100]
     x_positions = [margin]
     for w in col_widths[:-1]:
         x_positions.append(x_positions[-1] + w)
 
-    # Draw table header background and borders.
     c.setFillColorRGB(0.85, 0.85, 0.85)
     c.rect(margin, y_position - row_height, sum(col_widths), row_height, fill=1, stroke=0)
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 10)
-    headers = [
-        "S. No.",
-        "Particular",
-        "Name & Designation",
-        "Received Date",
-        "Approved Date"
-    ]
+    headers = ["S. No.", "Particular", "Name & Designation", "Received Date", "Approved Date"]
     for i, header in enumerate(headers):
         c.drawString(x_positions[i] + 2, y_position - row_height + 5, header)
-    # Draw header borders.
     temp_x = margin
     for w in col_widths:
         c.rect(temp_x, y_position - row_height, w, row_height, stroke=1, fill=0)
         temp_x += w
 
-    # Build table rows.
     rows = []
-    # Row 1: Initiator details.
     initiator = get_user_by_id(req["initiator_id"])
     initiator_name = initiator["name"] if initiator else "Unknown"
     rows.append({
@@ -762,7 +843,6 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         "received": req["created_at"],
         "approved": "-"
     })
-    # Row 2: Supervisor details.
     supervisor = get_user_by_id(req["supervisor_id"])
     supervisor_name = supervisor["name"] if supervisor else "Unknown"
     sup_approved = req.get("supervisor_approved_at") if req.get("supervisor_approved_at") else "Pending"
@@ -773,14 +853,13 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         "received": req["created_at"],
         "approved": sup_approved
     })
-    # Rows for each approver in the chain.
     sno = 3
     for approver_id in req["approvers"]:
         user_obj = get_user_by_id(approver_id)
         name = user_obj["name"] if user_obj else "Unknown"
         action_obj = get_approver_action(req["id"], approver_id)
-        received_date = action_obj.get("received_at") if action_obj and action_obj.get("received_at") else "N/A"
-        approved_date = action_obj.get("action_time") if action_obj and action_obj.get("action_time") else "Pending"
+        received_date = action_obj.get("received_at") if (action_obj and action_obj.get("received_at")) else "N/A"
+        approved_date = action_obj.get("action_time") if (action_obj and action_obj.get("action_time")) else "Pending"
         rows.append({
             "sno": str(sno),
             "particular": "Approver",
@@ -790,7 +869,6 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         })
         sno += 1
 
-    # Draw table rows.
     c.setFont("Helvetica", 10)
     current_y = y_position - row_height
     for row in rows:
@@ -805,15 +883,12 @@ async def download_pdf(request_id: int, current_user: dict = Depends(get_current
         c.drawString(x_positions[3] + 2, current_y + 5, row["received"])
         c.drawString(x_positions[4] + 2, current_y + 5, row["approved"])
 
-    # ----------------------------
-    # Draw a blue note at the bottom.
-    # ----------------------------
-    c.setFillColorRGB(0, 0, 1)  # Blue color.
+    c.setFillColorRGB(0, 0, 1)
     c.setFont("Helvetica-Bold", 12)
     note = "This is a system generated pdf, no need of signatures"
     note_width = c.stringWidth(note, "Helvetica-Bold", 12)
     c.drawString((width - note_width) / 2, 20, note)
-    c.setFillColorRGB(0, 0, 0)  # Revert to black.
+    c.setFillColorRGB(0, 0, 0)
 
     c.showPage()
     c.save()
@@ -830,28 +905,19 @@ async def upload_files_for_request(
     files: Optional[List[UploadFile]] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    print(f"[DEBUG] Entered upload_files_for_request for request_id: {request_id}")
     if not files:
-        print("[DEBUG] No files provided in the request")
         raise HTTPException(status_code=400, detail="No files provided")
-
     req = get_request_by_id(request_id)
     if not req:
-        print(f"[DEBUG] Request with id {request_id} not found")
         raise HTTPException(status_code=404, detail="Request not found")
     if req["initiator_id"] != current_user["id"]:
-        print(f"[DEBUG] User {current_user['id']} is not authorized to upload files for request {request_id}")
-        raise HTTPException(
-            status_code=403, 
-            detail="Not authorized to upload files for this request"
-        )
+        raise HTTPException(status_code=403, detail="Not authorized to upload files for this request")
 
     file_records = []
     for file in files:
         original_filename = file.filename or "unnamed_file"
         sanitized_filename = original_filename.replace(" ", "_")
         ext = sanitized_filename.split('.')[-1].lower() if '.' in sanitized_filename else ''
-        # (Optional) Choose a subfolder based on extension if needed:
         if ext == "pdf":
             subfolder = "pdf"
         elif ext in ["jpg", "jpeg", "png", "gif", "bmp"]:
@@ -863,28 +929,22 @@ async def upload_files_for_request(
         timestamp = datetime.now(IST).strftime('%Y%m%d%H%M%S')
         new_filename = f"{request_id}_{timestamp}_{sanitized_filename}"
         file_location = os.path.join(subfolder_path, new_filename)
-        print(f"[DEBUG] Saving file {original_filename} as {new_filename} in {subfolder_path}")
         try:
             file.file.seek(0)
             content = await file.read()
             with open(file_location, "wb") as f:
                 f.write(content)
-            print(f"[DEBUG] Successfully saved file at {file_location}")
         except Exception as e:
-            print(f"[DEBUG] Exception occurred while saving file {original_filename}: {e}")
             raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
-        
         file_record = {"file_url": f"/files/{subfolder}/{new_filename}", "file_display_name": original_filename}
         file_records.append(file_record)
-    
+
     if "files" not in req or not isinstance(req["files"], list):
         req["files"] = []
     req["files"].extend(file_records)
     update_request(req)
-    print(f"[DEBUG] Updated request record with files: {req['files']}")
     return {"files": req["files"]}
 
-# Supervisor Review Endpoint
 @app.post("/requests/supervisor-review", response_model=RequestResponse)
 async def supervisor_review(action: ApprovalAction, current_user: dict = Depends(get_current_user)):
     req = get_request_by_id(action.request_id)
@@ -894,21 +954,23 @@ async def supervisor_review(action: ApprovalAction, current_user: dict = Depends
         raise HTTPException(status_code=403, detail="You are not authorized to perform supervisor review for this request")
     if req.get("supervisor_approved") is not None:
         raise HTTPException(status_code=400, detail="Supervisor has already reviewed this request")
+
     current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
     req["supervisor_approved"] = action.approved
     req["supervisor_approved_at"] = current_time_str
     req["supervisor_comment"] = action.comment
     req["updated_at"] = current_time_str
+
     if action.approved:
         req["status"] = "IN_PROGRESS"
         req["last_action"] = f"Supervisor approved at {current_time_str}"
     else:
         req["status"] = "REJECTED"
         req["last_action"] = f"Supervisor rejected at {current_time_str}"
+
     update_request(req)
     return await to_request_response(req)
 
-# Approver Action Endpoint
 @app.post("/requests/approve", response_model=RequestResponse)
 async def approver_action(action: ApprovalAction, current_user: dict = Depends(get_current_user)):
     req = get_request_by_id(action.request_id)
@@ -918,12 +980,15 @@ async def approver_action(action: ApprovalAction, current_user: dict = Depends(g
         raise HTTPException(status_code=400, detail="Request is not in progress for approval")
     if req["current_approver_index"] >= len(req["approvers"]):
         raise HTTPException(status_code=400, detail="No pending approver action for this request")
+
     current_approver_id = req["approvers"][req["current_approver_index"]]
     if current_user["id"] != current_approver_id:
         raise HTTPException(status_code=403, detail="You are not authorized to approve this request")
+
     existing_action = get_approver_action(req["id"], current_user["id"])
     if existing_action is not None:
         raise HTTPException(status_code=400, detail="Approver has already taken action on this request")
+
     current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
     new_action = {
         "request_id": req["id"],
@@ -934,6 +999,7 @@ async def approver_action(action: ApprovalAction, current_user: dict = Depends(g
         "comment": action.comment
     }
     insert_approver_action(new_action)
+
     if action.approved:
         req["current_approver_index"] += 1
         req["last_action"] = f"Approver {current_user['id']} approved at {current_time_str}"
@@ -942,11 +1008,11 @@ async def approver_action(action: ApprovalAction, current_user: dict = Depends(g
     else:
         req["status"] = "REJECTED"
         req["last_action"] = f"Approver {current_user['id']} declined at {current_time_str}"
+
     req["updated_at"] = current_time_str
     update_request(req)
     return await to_request_response(req)
 
-# Reinitiate Request Endpoint
 @app.post("/requests/{request_id}/reinitiate", response_model=RequestResponse)
 async def reinitiate_request(
     request_id: int,
@@ -970,6 +1036,7 @@ async def reinitiate_request(
         raise HTTPException(status_code=403, detail="You are not allowed to reinitiate this request")
     if req["status"] != "REJECTED":
         raise HTTPException(status_code=400, detail="Only declined (REJECTED) requests can be re-initiated.")
+
     current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
     if edit_details:
         if not (subject and description and area and project and tower and department and references and priority and approvers):
@@ -981,6 +1048,7 @@ async def reinitiate_request(
                 raise ValueError
         except ValueError:
             raise HTTPException(status_code=400, detail="Approvers must be a JSON list of user IDs.")
+
         req["subject"] = subject
         req["description"] = description
         req["area"] = area
@@ -990,7 +1058,7 @@ async def reinitiate_request(
         req["references"] = references
         req["priority"] = priority
         req["approvers"] = approvers_list
-    # If edit_details is False, keep existing details.
+
     req["status"] = "NEW"
     req["current_approver_index"] = 0
     req["supervisor_approved"] = None
@@ -998,7 +1066,7 @@ async def reinitiate_request(
     req["supervisor_comment"] = None
     req["last_action"] = f"Request re-initiated at {current_time_str}"
     delete_approver_actions_by_request(req["id"])
-    # Process new file uploads if provided.
+
     if files is not None:
         if "files" not in req or not isinstance(req["files"], list):
             req["files"] = []
@@ -1018,6 +1086,7 @@ async def reinitiate_request(
                 req["files"].append(file_record)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
     req["updated_at"] = current_time_str
     update_request(req)
     return await to_request_response(req)
@@ -1035,18 +1104,29 @@ async def clear_db(current_user: dict = Depends(get_current_user)):
                 if key != b'__counter__':
                     txn.delete(key, db=DB_APPROVER_ACTIONS)
             txn.put(b'__counter__', b'0', db=DB_APPROVER_ACTIONS)
+
     with LMDB_ENV.begin(write=True, db=DB_REQUESTS) as txn:
         with txn.cursor(db=DB_REQUESTS) as cursor:
             for key, _ in cursor:
                 if key != b'__counter__':
                     txn.delete(key, db=DB_REQUESTS)
             txn.put(b'__counter__', b'0', db=DB_REQUESTS)
+
     with LMDB_ENV.begin(write=True, db=DB_USERS) as txn:
         with txn.cursor(db=DB_USERS) as cursor:
             for key, _ in cursor:
                 if key != b'__counter__':
                     txn.delete(key, db=DB_USERS)
             txn.put(b'__counter__', b'0', db=DB_USERS)
+
+    # Also clear the active_tokens sub-db
+    with LMDB_ENV.begin(write=True, db=DB_TOKENS) as txn:
+        with txn.cursor(db=DB_TOKENS) as cursor:
+            for key, _ in cursor:
+                if key != b'__counter__':
+                    txn.delete(key, db=DB_TOKENS)
+            txn.put(b'__counter__', b'0', db=DB_TOKENS)
+
     return {"detail": "Database cleared successfully."}
 
 @app.get("/transferdb", response_class=FileResponse)
@@ -1065,70 +1145,49 @@ async def accept_db(
 ):
     if 2 not in current_user["role"]:
         raise HTTPException(status_code=403, detail="Only admin users can accept the database.")
-    
-    # Normalize the file path to handle OS differences
     db_file = os.path.join(DATABASE_PATH, "data.mdb")
     normalized_db_file = os.path.normpath(db_file)
-    
     try:
-        # Close LMDB environment to release file locks (especially on Windows)
         global LMDB_ENV
         if LMDB_ENV is not None:
             LMDB_ENV.close()
-        
-        # Read the new database content from the uploaded file
         content = await file.read()
-        
-        # Write content to a temporary file first and then atomically replace
         temp_file = normalized_db_file + ".tmp"
         with open(temp_file, "wb") as f:
             f.write(content)
         os.replace(temp_file, normalized_db_file)
-        
-        # Reinitialize LMDB after replacement
         init_lmdb()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to replace the database file: {str(e)}")
-    
     return {"detail": "Database replaced successfully."}
 
-# --------------------------------------------------
-# 14. New Endpoint: Clear All Files in NFA Folder (Optional)
-# --------------------------------------------------
 @app.post("/clearfiles")
 async def clear_files(current_user: dict = Depends(get_current_user)):
     try:
-        for filename in os.listdir(UPLOAD_FOLDER):
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            if os.path.isfile(file_path):
-                os.remove(file_path)
+        for root, dirs, files in os.walk(UPLOAD_FOLDER):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear files: {str(e)}")
     return {"detail": "All files cleared successfully."}
 
 # --------------------------------------------------
-# 15. Application Startup
+# 14. Application Startup
 # --------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     init_lmdb()
 
-
-
-
-
-
 # --------------------------------------------------
-# ADMIN SECTION
+# ADMIN SECTION (Admin Router)
 # --------------------------------------------------
-
-# Create a dependency that verifies the current user is an admin.
 def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict:
     if 2 not in current_user["role"]:
         raise HTTPException(status_code=403, detail="Admin privileges required.")
     return current_user
 
-# Define additional Pydantic models for admin operations.
 class AdminEditUser(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
@@ -1141,28 +1200,23 @@ class AdminCreateUser(BaseModel):
     name: str
     role: List[int]
 
-# Create an APIRouter for admin endpoints.
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
-# 1) View Total Number of Requests
 @admin_router.get("/total-requests")
 async def total_requests(admin: dict = Depends(get_admin_user)):
     total = len(list_all_requests())
     return {"total_requests": total}
 
-# 2) Total Pending Requests (status NEW or IN_PROGRESS)
 @admin_router.get("/pending-requests")
 async def pending_requests(admin: dict = Depends(get_admin_user)):
     all_requests = list_all_requests()
     pending = [r for r in all_requests if r["status"] in ("NEW", "IN_PROGRESS")]
     return {"total_pending_requests": len(pending)}
 
-# 3) View All Users
 @admin_router.get("/users", response_model=List[UserResponse])
 async def admin_view_all_users(admin: dict = Depends(get_admin_user)):
     return list_all_users()
 
-# 4) Edit any User (username, password, name, role)
 @admin_router.put("/users/{user_id}", response_model=UserResponse)
 async def admin_edit_user(user_id: int, user_edit: AdminEditUser, admin: dict = Depends(get_admin_user)):
     user = get_user_by_id(user_id)
@@ -1179,7 +1233,6 @@ async def admin_edit_user(user_id: int, user_edit: AdminEditUser, admin: dict = 
     update_user(user)
     return user
 
-# 5) Add More Users
 @admin_router.post("/users", response_model=UserResponse)
 async def admin_create_user(user_data: AdminCreateUser, admin: dict = Depends(get_admin_user)):
     if get_user_by_username(user_data.username):
@@ -1193,7 +1246,6 @@ async def admin_create_user(user_data: AdminCreateUser, admin: dict = Depends(ge
     created_user = insert_user(new_user)
     return created_user
 
-# 6) Delete User
 @admin_router.delete("/users/{user_id}")
 async def admin_delete_user(user_id: int, admin: dict = Depends(get_admin_user)):
     with LMDB_ENV.begin(write=True, db=DB_USERS) as txn:
@@ -1203,19 +1255,16 @@ async def admin_delete_user(user_id: int, admin: dict = Depends(get_admin_user))
         txn.delete(key, db=DB_USERS)
     return {"detail": f"User {user_id} deleted successfully."}
 
-# 7) Find Out Number of Pending Requests per User
 @admin_router.get("/users/pending-requests")
 async def pending_requests_per_user(admin: dict = Depends(get_admin_user)):
     users = list_all_users()
     all_requests = list_all_requests()
     results = []
     for user in users:
-        # Count requests initiated by the user that are pending.
         pending = [r for r in all_requests if r["initiator_id"] == user["id"] and r["status"] in ("NEW", "IN_PROGRESS")]
         results.append({"user_id": user["id"], "pending_requests": len(pending)})
     return results
 
-# 8) Approve Requests on Behalf of the User (set status to "Approved by ADMIN")
 @admin_router.post("/requests/{request_id}/approve")
 async def admin_approve_request(request_id: int, admin: dict = Depends(get_admin_user)):
     req = get_request_by_id(request_id)
@@ -1228,10 +1277,8 @@ async def admin_approve_request(request_id: int, admin: dict = Depends(get_admin
     update_request(req)
     return {"detail": f"Request {request_id} approved by ADMIN."}
 
-# 9) View Uploaded Files by the User
 @admin_router.get("/users/{user_id}/files")
 async def admin_view_user_files(user_id: int, admin: dict = Depends(get_admin_user)):
-    # Aggregate files from all requests initiated by the user.
     user_requests = [r for r in list_all_requests() if r["initiator_id"] == user_id]
     files = []
     for req in user_requests:
@@ -1239,7 +1286,6 @@ async def admin_view_user_files(user_id: int, admin: dict = Depends(get_admin_us
             files.extend(req["files"])
     return {"user_id": user_id, "files": files}
 
-# 10) Delete Uploaded Files by the User
 @admin_router.delete("/requests/{request_id}/files")
 async def admin_delete_request_file(request_id: int, file_url: str, admin: dict = Depends(get_admin_user)):
     req = get_request_by_id(request_id)
@@ -1247,19 +1293,20 @@ async def admin_delete_request_file(request_id: int, file_url: str, admin: dict 
         raise HTTPException(status_code=404, detail="Request not found")
     if "files" not in req or not isinstance(req["files"], list):
         raise HTTPException(status_code=404, detail="No files found for this request")
+
     original_files = req["files"]
     updated_files = [f for f in original_files if f.get("file_url") != file_url]
     if len(updated_files) == len(original_files):
         raise HTTPException(status_code=404, detail="File not found in the request")
+
     req["files"] = updated_files
     update_request(req)
-    # Remove the file from the filesystem if it exists.
-    file_path = file_url.lstrip("/")  # Remove the leading slash to form a relative path.
+
+    file_path = file_url.lstrip("/")
     if os.path.exists(file_path):
         os.remove(file_path)
     return {"detail": f"File {file_url} deleted from request {request_id}."}
 
-# 11) Add More Files for the User (to a given request)
 @admin_router.post("/requests/{request_id}/files")
 async def admin_add_files_to_request(
     request_id: int,
@@ -1271,6 +1318,7 @@ async def admin_add_files_to_request(
     req = get_request_by_id(request_id)
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
+
     file_records = req.get("files", [])
     for file in files:
         original_filename = file.filename or "unnamed_file"
@@ -1278,18 +1326,17 @@ async def admin_add_files_to_request(
         timestamp = datetime.now(IST).strftime('%Y%m%d%H%M%S')
         new_filename = f"{request_id}_{timestamp}_{sanitized_filename}"
         file_location = os.path.join(UPLOAD_FOLDER, new_filename)
-        # For simplicity we use synchronous file I/O here; consider using aiofiles.
         file.file.seek(0)
         content = await file.read()
         with open(file_location, "wb") as f:
             f.write(content)
         file_record = {"file_url": f"/files/{new_filename}", "file_display_name": original_filename}
         file_records.append(file_record)
+
     req["files"] = file_records
     update_request(req)
     return {"detail": f"Files added to request {request_id}.", "files": file_records}
 
-# 12) Add Comments for the User (if they forgot to add in their section)
 @admin_router.post("/requests/{request_id}/comments")
 async def admin_add_comment(
     request_id: int,
@@ -1299,16 +1346,15 @@ async def admin_add_comment(
     req = get_request_by_id(request_id)
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
-    # Save admin comments in a new field (or append to existing comments)
     if "admin_comment" in req and req["admin_comment"]:
         req["admin_comment"] += f" | {comment}"
     else:
         req["admin_comment"] = comment
+
     current_time_str = datetime.now(IST).strftime("%d-%m-%Y %H:%M")
     req["last_action"] = f"Admin comment added at {current_time_str}"
     req["updated_at"] = current_time_str
     update_request(req)
     return {"detail": f"Comment added to request {request_id}.", "admin_comment": req["admin_comment"]}
 
-# Finally, include the admin router in your main FastAPI app.
 app.include_router(admin_router)
