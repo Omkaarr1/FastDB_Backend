@@ -260,17 +260,16 @@ def get_token_details(token: str) -> Optional[dict]:
     return None
 
 def list_tokens_by_user(user_id: int) -> List[dict]:
-    """
-    Lists all active sessions for a user by iterating over the DB_TOKENS sub-database.
-    Returns a list of session dictionaries that can include login_time, ip_address, user_agent, etc.
-    """
     sessions = []
     with LMDB_ENV.begin(db=DB_TOKENS) as txn:
         with txn.cursor(db=DB_TOKENS) as cursor:
             for key, value in cursor:
+                # Skip the counter key
+                if key == b'__counter__':
+                    continue
+
                 details = json.loads(value.decode())
                 if details.get("user_id") == user_id:
-                    # Convert created_at from string to datetime if needed
                     sessions.append({
                         "session_id": key.decode(),
                         "login_time": details.get("created_at"),
