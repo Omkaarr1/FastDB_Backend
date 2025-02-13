@@ -286,6 +286,9 @@ def remove_tokens_by_user(user_id: int):
         with txn.cursor(db=DB_TOKENS) as cursor:
             keys_to_delete = []
             for key, value in cursor:
+                # Skip the LMDB counter key
+                if key == b'__counter__':
+                    continue
                 details = json.loads(value.decode())
                 if details.get("user_id") == user_id:
                     keys_to_delete.append(key)
